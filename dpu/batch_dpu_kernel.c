@@ -18,6 +18,10 @@
 
 #include <alloc.h>
 
+#if LUT_TILE_NUM != 1
+#error "batch_dpu_kernel does not support LUT tiling yet"
+#endif
+
 /**
  * Copyright (c) Facebook, Inc. and its affiliates.
  *

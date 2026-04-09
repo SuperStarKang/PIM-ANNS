@@ -302,6 +302,8 @@ __host DPU_INFO_COMMON dpu_info_common;
 
 __mram volatile DATA_TYPE data[SLOT_NUM * SLOT_L * MY_PQ_M + 1000];
 __mram volatile ID_TYPE data_id[SLOT_NUM * SLOT_L + 1000];
+__mram DIST_TYPE query_lut[LUT_SIZE];
+__mram DIST_TYPE partial_sums[SLOT_L + 1000];
 
 #define INDEX_DATA(i, j, k) ((i) * (SLOT_L) * (MY_PQ_M) + (j) * (MY_PQ_M) + (k))
 #define INDEX_ID(i, j) ((i) * (SLOT_L) + (j))
@@ -316,16 +318,18 @@ __host dpu_fifo_output_t result;
 
 #define DSIZE 10
 #define IDSIZE DSIZE
-__host DIST_TYPE lutw[LUT_SIZE];
+__host DIST_TYPE lutw[TILE_LUT_SIZE];
 
-__host DATA_TYPE data_wram[NR_TASKLETS * DSIZE * MY_PQ_M];
+__host DATA_TYPE data_wram[NR_TASKLETS * DSIZE * LUT_TILE_M];
+__host DIST_TYPE partial_wram[NR_TASKLETS * DSIZE];
 
 __host ID_TYPE id_wram[NR_TASKLETS * IDSIZE];
 
 #define INDEX_DATA_W(i, j, k) \
-    ((i) * (DSIZE) * (MY_PQ_M) + (j) * (MY_PQ_M) + (k))
+    ((i) * (DSIZE) * (LUT_TILE_M) + (j) * (LUT_TILE_M) + (k))
 
 #define INDEX_ID_W(i, j) ((i) * (IDSIZE) + (j))
+#define INDEX_PARTIAL_W(i, j) ((i) * (DSIZE) + (j))
 
 __host DIST_TYPE local_dis_all[NR_TASKLETS * MAX_K];
 __host ID_TYPE local_id_all[NR_TASKLETS * MAX_K];
@@ -364,17 +368,6 @@ void task_perf() {
     }
     barrier_wait(&barrier);
 
-    if (t_id == 0) {
-        for (int i = 0; i < MY_PQ_M; i++) {
-            mram_read(
-                    (__mram_ptr void*)&query.LUT[i * MY_PQ_CLUSTER],
-                    &lutw[i * MY_PQ_CLUSTER],
-                    MY_PQ_CLUSTER * sizeof(DIST_TYPE));
-        }
-    }
-
-    barrier_wait(&barrier);
-
     int totallen = query.shard_l;
 
     int chunk_size = totallen / NR_TASKLETS;
@@ -391,6 +384,67 @@ void task_perf() {
 
     barrier_wait(&barrier);
 
+    for (int tile_id = 0; tile_id < LUT_TILE_NUM; tile_id++) {
+        const int tile_base_m = tile_id * LUT_TILE_M;
+
+        if (t_id == 0) {
+            for (int row = 0; row < LUT_TILE_M; row++) {
+                mram_read(
+                        (__mram_ptr void*)&query_lut[(tile_base_m + row) * MY_PQ_CLUSTER],
+                        &lutw[row * MY_PQ_CLUSTER],
+                        MY_PQ_CLUSTER * sizeof(DIST_TYPE));
+            }
+        }
+
+        barrier_wait(&barrier);
+
+        for (int i = start; i < (start + chunk_size); i += DSIZE) {
+            int use_len = DSIZE;
+
+            if ((i + DSIZE) >= (start + chunk_size)) {
+                use_len = (start + chunk_size) - i;
+            }
+
+            mram_read(
+                    (__mram_ptr void*)&data[INDEX_DATA(slot_id, i, tile_base_m)],
+                    &data_wram[INDEX_DATA_W(t_id, 0, 0)],
+                    DSIZE * LUT_TILE_M * sizeof(DATA_TYPE));
+
+            DIST_TYPE *partial_chunk = &partial_wram[INDEX_PARTIAL_W(t_id, 0)];
+            if (tile_id == 0) {
+                for (int j = 0; j < use_len; j++) {
+                    partial_chunk[j] = query.dis0;
+                }
+            } else {
+                mram_read(
+                        (__mram_ptr void*)&partial_sums[i],
+                        partial_chunk,
+                        DSIZE * sizeof(DIST_TYPE));
+            }
+
+            int data_wram_index = INDEX_DATA_W(t_id, 0, 0);
+
+            for (int j = 0; j < use_len; j++) {
+                DIST_TYPE sum = partial_chunk[j];
+                int index_lutw = 0;
+                for (int l = 0; l < LUT_TILE_M; l++) {
+                    uint8_t pqcode = data_wram[data_wram_index + l];
+                    sum += lutw[index_lutw + pqcode];
+                    index_lutw += MY_PQ_CLUSTER;
+                }
+                partial_chunk[j] = sum;
+                data_wram_index += LUT_TILE_M;
+            }
+
+            mram_write(
+                    partial_chunk,
+                    (__mram_ptr void*)&partial_sums[i],
+                    DSIZE * sizeof(DIST_TYPE));
+        }
+
+        barrier_wait(&barrier);
+    }
+
     for (int i = start; i < (start + chunk_size); i += DSIZE) {
         int use_len = DSIZE;
 
@@ -402,25 +456,16 @@ void task_perf() {
                 &id_wram[INDEX_ID_W(t_id, 0)],
                 DSIZE * sizeof(ID_TYPE));
         mram_read(
-                (__mram_ptr void*)&data[INDEX_DATA(slot_id, i, 0)],
-                &data_wram[INDEX_DATA_W(t_id, 0, 0)],
-                DSIZE * MY_PQ_M * sizeof(DATA_TYPE));
+                (__mram_ptr void*)&partial_sums[i],
+                &partial_wram[INDEX_PARTIAL_W(t_id, 0)],
+                DSIZE * sizeof(DIST_TYPE));
 
-        int data_wram_index = INDEX_DATA_W(t_id, 0, 0);
+        DIST_TYPE *partial_chunk = &partial_wram[INDEX_PARTIAL_W(t_id, 0)];
         int id_wram_index = INDEX_ID_W(t_id, 0);
 
         for (int j = 0; j < use_len; j++) {
             ID_TYPE id = id_wram[id_wram_index + j];
-            DIST_TYPE sum = query.dis0;
-
-            int index_lutw = 0;
-            for (int l = 0; l < MY_PQ_M; l++) {
-                uint8_t pqcode = data_wram[data_wram_index + l];
-
-                sum += lutw[index_lutw + pqcode];
-                index_lutw += MY_PQ_CLUSTER;
-            }
-            data_wram_index += MY_PQ_M;
+            DIST_TYPE sum = partial_chunk[j];
 
             if (local_dis[0] > sum) {
                 heap_replace_top1(query.k, local_dis, local_id, sum, id);

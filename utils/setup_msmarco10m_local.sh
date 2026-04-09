@@ -32,5 +32,6 @@ echo
 echo "Notes:"
 echo "  - This stages symlinks only. Original files under /home/jiet/msmarco are unchanged."
 echo "  - query_1024_fp32.fvecs and groundtruth.ivecs are now readable by the current runtime."
-echo "  - msmarco10M.4096.128.8.index is suitable for CPU sanity checks."
-echo "  - DPU mode still requires a smaller-PQ index such as 4096/16/8 or 4096/32/8."
+echo "  - msmarco10M.4096.128.8.index can be used with the LUT-tiling DPU path on this branch."
+echo "  - Set common/dataset.h to MY_PQ_M=128 and keep LUT_TILE_M=32 for tiled DPU execution."
+echo "  - TEST_BATCH_DPU is still unsupported when LUT_TILE_NUM > 1."

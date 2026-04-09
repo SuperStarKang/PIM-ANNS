@@ -2,9 +2,12 @@
 
 #define TEST_DPU
 
-#define MY_PQ_M 32
+// Full PQ code width. For MSMARCO10M 4096/128/8, keep this at 128.
+#define MY_PQ_M 128
+// LUT staging width per transfer / per DPU tile accumulation step.
+#define LUT_TILE_M 32
 
-#define DIM 128
+#define DIM 1024
 
 // u8bin uint8 query: 0
 // signed int8 query: 1
@@ -63,6 +66,7 @@
 
 // when DIST_TYPE change, MAX_VALUE should be changed accordingly
 #define DIST_TYPE int32_t
+// #define DIST_TYPE float # 개느림
 #define ID_TYPE int64_t
 
 
@@ -74,10 +78,20 @@
 
 
 #define LUT_SIZE (MY_PQ_M * MY_PQ_CLUSTER)
+#define TILE_LUT_SIZE (LUT_TILE_M * MY_PQ_CLUSTER)
+#define LUT_TILE_NUM (((MY_PQ_M) + (LUT_TILE_M) - 1) / (LUT_TILE_M))
 
 #define SLOT_DATA_SIZE (SLOT_L * MY_PQ_M * sizeof(DATA_TYPE))
 #define SLOT_ID_SIZE (SLOT_L * sizeof(ID_TYPE))
 #define SLOT_NUM ((MRAM_SIZE) / (SLOT_DATA_SIZE + SLOT_ID_SIZE))
+
+#if LUT_TILE_M <= 0
+#error "LUT_TILE_M must be positive"
+#endif
+
+#if MY_PQ_M % LUT_TILE_M != 0
+#error "MY_PQ_M must be divisible by LUT_TILE_M for LUT tiling"
+#endif
 
 
 // because batch dpu need more mram to store lut, so there is less mram for load balance

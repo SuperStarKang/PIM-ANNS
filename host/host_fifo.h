@@ -582,7 +582,13 @@ public:
 
         void cpu_search(int *q_id, int k, int nprobe, int batch_size);
 
-        void fake_send_task(dpu_fifo_input_t &query);
+        void fake_send_task(dpu_fifo_input_t &query, const DIST_TYPE *lut);
+
+        void stage_query_lut_tiles(
+            int dpu_id,
+            int friend_dpu_id,
+            int enable_num,
+            const DIST_TYPE *lut);
 
         void cooperative(
             coroutine<void>::push_type &sink,

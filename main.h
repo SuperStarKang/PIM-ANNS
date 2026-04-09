@@ -550,12 +550,13 @@ void kernel_fakehost()
     }
 
     dpu_fifo_input_t query;
+    DIST_TYPE lut[LUT_SIZE];
     query.dpu_id = 0;
     query.q_id = 0;
     query.dis0 = (DIST_TYPE)(rand() % 100);
     for (int j = 0; j < LUT_SIZE; j++)
     {
-        query.LUT[j] = (DIST_TYPE)(rand() % 100);
+        lut[j] = (DIST_TYPE)(rand() % 100);
     }
     query.k = 10;
     query.shard_id = 0;
@@ -568,6 +569,8 @@ void kernel_fakehost()
             dpu_copy_to(dpu, "data", 0, data, SLOT_L * sizeof(DATA_TYPE)));
         DPU_ASSERT(dpu_copy_to(
             dpu, "data_id", 0, data_id, SLOT_L * sizeof(ID_TYPE)));
+        DPU_ASSERT(
+            dpu_copy_to(dpu, "query_lut", 0, lut, LUT_SIZE * sizeof(DIST_TYPE)));
         DPU_ASSERT(
             dpu_copy_to(dpu, "query", 0, &query, sizeof(dpu_fifo_input_t)));
     }

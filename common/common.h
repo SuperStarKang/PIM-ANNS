@@ -28,9 +28,9 @@ typedef struct dpu_fifo_input_t
     int q_id;
 
     DIST_TYPE dis0;
-
-
+#if LUT_TILE_NUM == 1
     MRAM_PTR DIST_TYPE LUT[LUT_SIZE];
+#endif
 } __attribute__((aligned(8))) dpu_fifo_input_t;
 
 

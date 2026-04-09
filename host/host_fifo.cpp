@@ -1001,13 +1001,13 @@ void DPUWrapper::dpu_init()
 
     for (int i = 0; i < FRONT_THREAD * MAX_COROUTINE; i++)
     {
-        float *sim_table_tmp = new float[MAX_NPROBE * LUT_SIZE];
+        float *sim_table_tmp = new float[LUT_SIZE];
         sim_table_buffer[i] = sim_table_tmp;
         float *dis0_tmp = new float[MAX_NPROBE];
         dis0_buffer[i] = dis0_tmp;
 
         DIST_TYPE *sim_table_tmp_dynamic =
-            new DIST_TYPE[MAX_NPROBE * LUT_SIZE];
+            new DIST_TYPE[LUT_SIZE];
         sim_table_dynamictype[i] = sim_table_tmp_dynamic;
 
         DIST_TYPE *dis0_tmp_dynamic = new DIST_TYPE[MAX_NPROBE];
@@ -1182,7 +1182,7 @@ void DPUWrapper::get_freq_num(int q_id, int k, int nprobe)
     }
 }
 
-void DPUWrapper::fake_send_task(dpu_fifo_input_t &query)
+void DPUWrapper::fake_send_task(dpu_fifo_input_t &query, const DIST_TYPE *lut)
 {
     int k = query.k;
     int q_id = query.q_id;
@@ -1190,7 +1190,6 @@ void DPUWrapper::fake_send_task(dpu_fifo_input_t &query)
     DIST_TYPE *simi_values = query_info[q_id]->simi_values;
     ID_TYPE *simi_ids = query_info[q_id]->simi_ids;
 
-    DIST_TYPE *LUT = query.LUT;
     int shard_l = query.shard_l;
     int dpu_id = query.dpu_id;
     int slot_id = query.slot_id;
@@ -1208,13 +1207,39 @@ void DPUWrapper::fake_send_task(dpu_fifo_input_t &query)
         for (int l = 0; l < MY_PQ_M; l++)
         {
             uint8_t pqcode = data_this_slot[j * MY_PQ_M + l];
-            sum += LUT[l * MY_PQ_CLUSTER + pqcode];
+            sum += lut[l * MY_PQ_CLUSTER + pqcode];
         }
         if (simi_values[0] > sum)
         {
             faiss::heap_replace_top<faiss::CMax<DIST_TYPE, ID_TYPE>>(
                 k, simi_values, simi_ids, sum, id);
         }
+    }
+}
+
+void DPUWrapper::stage_query_lut_tiles(
+    int dpu_id,
+    int friend_dpu_id,
+    int enable_num,
+    const DIST_TYPE *lut)
+{
+    for (int tile_id = 0; tile_id < LUT_TILE_NUM; tile_id++)
+    {
+        const int tile_base_m = tile_id * LUT_TILE_M;
+        const int tile_entry_count = LUT_TILE_M * MY_PQ_CLUSTER;
+        const uint32_t tile_offset =
+            static_cast<uint32_t>(tile_base_m * MY_PQ_CLUSTER * sizeof(DIST_TYPE));
+
+        fifo_dpu_copy_to(
+            dpu_id,
+            friend_dpu_id,
+            enable_num,
+            "query_lut",
+            tile_offset,
+            (const void *)(lut + tile_base_m * MY_PQ_CLUSTER),
+            (const void *)(lut + tile_base_m * MY_PQ_CLUSTER),
+            sizeof(DIST_TYPE) * tile_entry_count,
+            0);
     }
 }
 
@@ -1294,25 +1319,7 @@ void DPUWrapper::level2_search(
     for (int i = 0; i < query->nprobe; i++)
     {
         scanner[t_c_id]->set_list(query->idx[i], query->coarse_dis[i]);
-        scanner[t_c_id]->get_sim_table(
-            &sim_table_[i * LUT_SIZE], LUT_SIZE);
-
-        // memcpy(
-        //     &sim_table_[query->idx[i] * LUT_SIZE],
-        //     scanner[t_c_id]->sim_table,
-        //     LUT_SIZE * sizeof(float));
-
-        int c_id = query->idx[i];
-
         scanner[t_c_id]->get_dis0(dis0_[i]);
-
-        // dis0_[c_id] = scanner[t_c_id]->dis0;
-
-        for (int j = 0; j < LUT_SIZE; j++)
-        {
-            sim_table_dynamic[i * LUT_SIZE + j] =
-                (DIST_TYPE)(sim_table_[i * LUT_SIZE + j]);
-        }
         dis0_dynamic[i] = (DIST_TYPE)(dis0_[i]);
 
         if (trace_query && i < 2)
@@ -1325,7 +1332,7 @@ void DPUWrapper::level2_search(
 
     if (trace_query)
     {
-        trace_log("level2_search: q_id=%d LUT build done", q_id);
+        trace_log("level2_search: q_id=%d probe metadata prepared", q_id);
     }
 
     // timer.end();
@@ -1377,6 +1384,32 @@ void DPUWrapper::level2_search(
             std::shared_ptr<CLUSTER_INFO> cluster = cluster_info[key];
 
             int pair_shard_num = cluster->pair_shard_num;
+            bool has_pending_send = false;
+            for (int j = 0; j < pair_shard_num; j++)
+            {
+                if (send_flag_[i * MAX_SHARD + j])
+                {
+                    has_pending_send = true;
+                    break;
+                }
+            }
+            if (!has_pending_send)
+            {
+                continue;
+            }
+
+            scanner[t_c_id]->set_list(key, query->coarse_dis[i]);
+            scanner[t_c_id]->get_sim_table(sim_table_, LUT_SIZE);
+            for (int j = 0; j < LUT_SIZE; j++)
+            {
+                sim_table_dynamic[j] = static_cast<DIST_TYPE>(sim_table_[j]);
+            }
+
+            if (trace_query && i < 2)
+            {
+                trace_log("level2_search: q_id=%d probe=%d LUT staged entries=%d",
+                          q_id, i, LUT_SIZE);
+            }
 
             if (MAX_COROUTINE == 1)
             {
@@ -1465,9 +1498,6 @@ void DPUWrapper::level2_search(
                                 pair_task->task[task_id].k = k;
                                 pair_task->task[task_id].dis0 =
                                     dis0_dynamic[i];
-                                memcpy(pair_task->task[task_id].LUT,
-                                       &sim_table_dynamic[i * LUT_SIZE],
-                                       sizeof(DIST_TYPE) * LUT_SIZE);
                             }
 
                             if (trace_query)
@@ -1511,6 +1541,11 @@ void DPUWrapper::level2_search(
                                     trace_log("level2_search: q_id=%d before fifo_dpu_copy_to dpu_id=%d friend_dpu_id=%d rank_id=%d",
                                               q_id, dpu_id, friend_dpu_id, rank_id);
                                 }
+                                stage_query_lut_tiles(
+                                    dpu_id,
+                                    friend_dpu_id,
+                                    2,
+                                    sim_table_dynamic);
                                 fifo_dpu_copy_to(
                                     dpu_id,
                                     friend_dpu_id,
@@ -1537,6 +1572,11 @@ void DPUWrapper::level2_search(
                                     trace_log("level2_search: q_id=%d before fifo_dpu_copy_to single dpu_id=%d rank_id=%d",
                                               q_id, dpu_id, rank_id);
                                 }
+                                stage_query_lut_tiles(
+                                    dpu_id,
+                                    -1,
+                                    1,
+                                    sim_table_dynamic);
                                 fifo_dpu_copy_to(
                                     dpu_id,
                                     -1,
@@ -1692,9 +1732,6 @@ void DPUWrapper::level2_search(
                             pair_task->task[task_id].q_id = q_id;
                             pair_task->task[task_id].k = k;
                             pair_task->task[task_id].dis0 = dis0_dynamic[i];
-                            memcpy(pair_task->task[task_id].LUT,
-                                   &sim_table_dynamic[i * LUT_SIZE],
-                                   sizeof(DIST_TYPE) * LUT_SIZE);
                         }
 
                         if (trace_query)
@@ -1748,6 +1785,11 @@ void DPUWrapper::level2_search(
                                 trace_log("level2_search: q_id=%d before fifo_dpu_copy_to dpu_id=%d friend_dpu_id=%d rank_id=%d",
                                           q_id, dpu_id, friend_dpu_id, rank_id);
                             }
+                            stage_query_lut_tiles(
+                                dpu_id,
+                                friend_dpu_id,
+                                2,
+                                sim_table_dynamic);
                             fifo_dpu_copy_to(
                                 dpu_id,
                                 friend_dpu_id,
@@ -1776,6 +1818,11 @@ void DPUWrapper::level2_search(
                                 trace_log("level2_search: q_id=%d before fifo_dpu_copy_to single dpu_id=%d rank_id=%d",
                                           q_id, dpu_id, rank_id);
                             }
+                            stage_query_lut_tiles(
+                                dpu_id,
+                                -1,
+                                1,
+                                sim_table_dynamic);
                             fifo_dpu_copy_to(
                                 dpu_id,
                                 -1,
@@ -3763,6 +3810,10 @@ void DPUWrapper::dpu_search_batch(
     int type,
     std::ofstream &outfile_active_num)
 {
+#if LUT_TILE_NUM != 1
+    throw std::runtime_error(
+        "dpu_search_batch does not support LUT tiling; use TEST_DPU for pq_m > LUT_TILE_M");
+#else
     std::string active_num_path;
 
     auto start_before = std::chrono::high_resolution_clock::now();
@@ -3818,6 +3869,7 @@ void DPUWrapper::dpu_search_batch(
     DIST_TYPE *dis0_buffer_tmp = new DIST_TYPE[batch_size * nprobe];
     DIST_TYPE *sim_table_buffer_tmp =
         new DIST_TYPE[batch_size * nprobe * LUT_SIZE];
+    std::unique_ptr<float[]> sim_table_probe(new float[LUT_SIZE]);
 
     for (int i = 0; i < batch_size; i++)
     {
@@ -3825,10 +3877,6 @@ void DPUWrapper::dpu_search_batch(
         std::shared_ptr<QUERY_INFO> query = query_info[q_id_i];
 
         scanner[0]->set_query(query->query_data);
-
-        float *dis0_ = dis0_buffer[0];
-
-        float *sim_table_ = sim_table_buffer[0];
 
         DIST_TYPE *dis0_dynamic = &dis0_buffer_tmp[i * nprobe];
 
@@ -3840,23 +3888,22 @@ void DPUWrapper::dpu_search_batch(
             int c_id = query->idx[j];
 
             scanner[0]->set_list(c_id, query->coarse_dis[j]);
-            scanner[0]->get_dis0(dis0_[c_id]);
-            // dis0_[c_id] = scanner[0]->dis0;
+            float probe_dis0 = 0.0f;
+            scanner[0]->get_dis0(probe_dis0);
 
-            dis0_dynamic[j] = (DIST_TYPE)(dis0_[c_id]);
+            dis0_dynamic[j] = static_cast<DIST_TYPE>(probe_dis0);
 
-            scanner[0]->get_sim_table(
-                &sim_table_[c_id * LUT_SIZE], LUT_SIZE);
+            scanner[0]->get_sim_table(sim_table_probe.get(), LUT_SIZE);
 
             // memcpy(
-            //     &sim_table_[c_id * LUT_SIZE],
+            //     sim_table_probe.get(),
             //     scanner[0]->sim_table,
             //     LUT_SIZE * sizeof(float));
 
             for (int j1 = 0; j1 < LUT_SIZE; j1++)
             {
                 sim_table_dynamic[j * LUT_SIZE + j1] =
-                    (DIST_TYPE)(sim_table_[c_id * LUT_SIZE + j1]);
+                    static_cast<DIST_TYPE>(sim_table_probe[j1]);
             }
         }
     }
@@ -4242,4 +4289,5 @@ void DPUWrapper::dpu_search_batch(
     xmh::PerfCounter::Record("merge result", duration.count());
 
     timer3.end();
+#endif
 }
