@@ -1,4 +1,8 @@
-PROJECT_ROOT="/home/wupuqing/workspace/PIM-ANNS"
+# PROJECT_ROOT="/home/wupuqing/workspace/PIM-ANNS"
+
+# fix path
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/../.." && pwd)"
 
 rm -rf "$PROJECT_ROOT/SIFT1B32M4096_DIR"
 rm -rf "$PROJECT_ROOT/SPACE1B20M4096_DIR"

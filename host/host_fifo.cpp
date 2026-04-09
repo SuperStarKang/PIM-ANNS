@@ -1,10 +1,139 @@
-
-
 #include "host/host_fifo.h"
+#include <cerrno>
+#include <cstdarg>
 
 std::vector<std::shared_ptr<QUERY_INFO>> query_info;
 
 struct dpu_set_t fifo_set;
+
+namespace {
+std::mutex g_rank_id_map_mutex;
+std::unordered_map<int, int> g_rank_id_map;
+int g_next_rank_id = 0;
+std::atomic<int> g_trace_counter{0};
+
+void trace_log(const char *fmt, ...)
+{
+    const int trace_id = g_trace_counter.fetch_add(1, std::memory_order_relaxed);
+    const auto tid_hash = std::hash<std::thread::id>{}(std::this_thread::get_id());
+
+    std::lock_guard<std::mutex> lock(g_rank_id_map_mutex);
+    std::fprintf(stderr, "[pim-trace %05d tid=%zu] ", trace_id, tid_hash);
+
+    va_list args;
+    va_start(args, fmt);
+    std::vfprintf(stderr, fmt, args);
+    va_end(args);
+
+    std::fputc('\n', stderr);
+    std::fflush(stderr);
+}
+
+std::size_t get_coroutine_stack_size_bytes()
+{
+    const char *env = std::getenv("PIM_ANNS_COROUTINE_STACK_SIZE");
+    if (env == nullptr || *env == '\0')
+    {
+        return 1024 * 1024;
+    }
+
+    char *end = nullptr;
+    errno = 0;
+    unsigned long long parsed = std::strtoull(env, &end, 10);
+    if (errno != 0 || end == env || (end != nullptr && *end != '\0') || parsed == 0)
+    {
+        trace_log("invalid PIM_ANNS_COROUTINE_STACK_SIZE='%s', fallback=1048576", env);
+        return 1024 * 1024;
+    }
+
+    return static_cast<std::size_t>(parsed);
+}
+
+int get_or_assign_dense_rank_id(int physical_rank_id)
+{
+    std::lock_guard<std::mutex> lock(g_rank_id_map_mutex);
+    auto it = g_rank_id_map.find(physical_rank_id);
+    if (it != g_rank_id_map.end())
+    {
+        return it->second;
+    }
+
+    int dense_rank_id = g_next_rank_id++;
+    if (dense_rank_id >= MAX_RANK)
+    {
+        throw std::runtime_error(
+            "Dense rank id exceeds MAX_RANK: physical=" +
+            std::to_string(physical_rank_id) + ", dense=" +
+            std::to_string(dense_rank_id));
+    }
+
+    g_rank_id_map.emplace(physical_rank_id, dense_rank_id);
+    return dense_rank_id;
+}
+} // namespace
+
+int get_rank_linear_id(struct dpu_t *dpu)
+{
+    return get_or_assign_dense_rank_id(dpu_get_rank_id(dpu_get_rank(dpu)));
+}
+
+int get_rank_linear_id(struct dpu_rank_t *rank)
+{
+    return get_or_assign_dense_rank_id(dpu_get_rank_id(rank));
+}
+
+#if defined(TEST_CPU)
+extern "C" {
+uint32_t fifo_get_symbol_offset(struct dpu_set_t, const char *, uint32_t)
+{
+    return 0;
+}
+
+dpu_error_t fifo_host_get_access_for_transfer_matrix(struct dpu_rank_t *, void **)
+{
+    return DPU_OK;
+}
+
+void fifo_write_to_rank(
+    void **,
+    uint64_t *,
+    uint32_t,
+    uint32_t,
+    uint8_t,
+    uint8_t,
+    uint32_t,
+    uint32_t)
+{
+}
+
+void fifo_read_from_rank(
+    void **,
+    uint64_t *,
+    uint32_t,
+    uint32_t,
+    uint8_t,
+    uint8_t,
+    uint32_t,
+    uint32_t)
+{
+}
+
+dpu_error_t fifo_host_release_access_for_transfer_matrix(struct dpu_rank_t *, void **)
+{
+    return DPU_OK;
+}
+
+dpu_error_t dpu_disable_one_dpu(struct dpu_t *)
+{
+    return DPU_OK;
+}
+
+uint64_t *get_rank_ptr(struct dpu_rank_t *)
+{
+    return nullptr;
+}
+}
+#endif
 
 void DPUWrapper::shard_dataset()
 {
@@ -395,103 +524,115 @@ void DPUWrapper::copy_dataset()
                 xfer_l = std::max(xfer_l, dpu_info[i].enable_slot_num);
             }
         }
-        int batch_num = 5;
+        int batch_num = std::min(5, std::max(1, xfer_l));
         int xfer_l_start = 0;
-        int xfer_l_len = xfer_l / batch_num;
+        int xfer_l_len = CEIL_DIV(xfer_l, batch_num);
         for (int i = 0; i < batch_num; i++)
         {
-            if (i == batch_num - 1)
+            int remaining = xfer_l - xfer_l_start;
+            if (remaining <= 0)
             {
-                xfer_l_len = xfer_l - xfer_l_start;
+                break;
             }
-            DATA_TYPE *data = new DATA_TYPE
-                [MAX_DPU * xfer_l_len * SLOT_DATA_SIZE / sizeof(DATA_TYPE)];
-            ID_TYPE *ids = new ID_TYPE
-                [MAX_DPU * xfer_l_len * SLOT_ID_SIZE / sizeof(ID_TYPE)];
-
-            for (int j = 0; j < MAX_DPU; j++)
+            xfer_l_len = std::min(xfer_l_len, remaining);
+            dpu_set_t rank;
+            DPU_RANK_FOREACH(fifo_set, rank)
             {
-                int slot_start, slot_end;
-                SLOT_INFO *slot_info = dpu_info[j].slot_info;
-                int enable_slot_num = dpu_info[j].enable_slot_num;
-                if (enable_slot_num > xfer_l_start + xfer_l_len)
-                {
-                    slot_start = xfer_l_start;
-                    slot_end = xfer_l_start + xfer_l_len;
-                }
-                else if (enable_slot_num <= xfer_l_start)
-                {
-                    slot_start = 0;
-                    slot_end = 0;
-                    continue;
-                }
-                else
-                {
-                    slot_start = xfer_l_start;
-                    slot_end = enable_slot_num;
-                }
-                for (int slot_id = slot_start; slot_id < slot_end; slot_id++)
-                {
-                    int c_id = slot_info[slot_id].c_id;
-                    int s_id = slot_info[slot_id].shard_id;
-                    int shard_l = slot_info[slot_id].shard_l;
+                DATA_TYPE *data = new DATA_TYPE
+                    [MAX_NR_DPUS_PER_RANK * xfer_l_len * SLOT_DATA_SIZE / sizeof(DATA_TYPE)]();
+                ID_TYPE *ids = new ID_TYPE
+                    [MAX_NR_DPUS_PER_RANK * xfer_l_len * SLOT_ID_SIZE / sizeof(ID_TYPE)]();
 
-                    int align8 = (shard_l + 7) & ~7;
+                dpu_set_t dpu;
+                int local_dpu_idx = 0;
+                DPU_FOREACH(rank, dpu)
+                {
+                    int dpu_id = GET_DPU_ID_BY_DPU(dpu);
 
-                    DATA_TYPE *data_tmp = getdata(c_id, s_id);
-                    ID_TYPE *ids_tmp = getids(c_id, s_id);
+                    int slot_start, slot_end;
+                    SLOT_INFO *slot_info = dpu_info[dpu_id].slot_info;
+                    int enable_slot_num = dpu_info[dpu_id].enable_slot_num;
+                    if (enable_slot_num > xfer_l_start + xfer_l_len)
+                    {
+                        slot_start = xfer_l_start;
+                        slot_end = xfer_l_start + xfer_l_len;
+                    }
+                    else if (enable_slot_num <= xfer_l_start)
+                    {
+                        slot_start = 0;
+                        slot_end = 0;
+                    }
+                    else
+                    {
+                        slot_start = xfer_l_start;
+                        slot_end = enable_slot_num;
+                    }
 
-                    memcpy(&data[(j * xfer_l_len + slot_id - slot_start) *
-                                 SLOT_DATA_SIZE / sizeof(DATA_TYPE)],
-                           (void *)data_tmp,
-                           align8 * MY_PQ_M * sizeof(DATA_TYPE));
+                    for (int slot_id = slot_start; slot_id < slot_end; slot_id++)
+                    {
+                        int c_id = slot_info[slot_id].c_id;
+                        int s_id = slot_info[slot_id].shard_id;
+                        int shard_l = slot_info[slot_id].shard_l;
 
-                    memcpy(&ids[(j * xfer_l_len + slot_id - slot_start) *
-                                SLOT_ID_SIZE / sizeof(ID_TYPE)],
-                           (void *)ids_tmp,
-                           align8 * sizeof(ID_TYPE));
+                        int align8 = (shard_l + 7) & ~7;
+
+                        DATA_TYPE *data_tmp = getdata(c_id, s_id);
+                        ID_TYPE *ids_tmp = getids(c_id, s_id);
+
+                        memcpy(&data[(local_dpu_idx * xfer_l_len + slot_id - slot_start) *
+                                     SLOT_DATA_SIZE / sizeof(DATA_TYPE)],
+                               (void *)data_tmp,
+                               align8 * MY_PQ_M * sizeof(DATA_TYPE));
+
+                        memcpy(&ids[(local_dpu_idx * xfer_l_len + slot_id - slot_start) *
+                                    SLOT_ID_SIZE / sizeof(ID_TYPE)],
+                               (void *)ids_tmp,
+                               align8 * sizeof(ID_TYPE));
+                    }
+
+                    local_dpu_idx++;
                 }
+
+                local_dpu_idx = 0;
+                DPU_FOREACH(rank, dpu)
+                {
+                    DPU_ASSERT(dpu_prepare_xfer(
+                        dpu,
+                        &data[local_dpu_idx * xfer_l_len * SLOT_DATA_SIZE /
+                              sizeof(DATA_TYPE)]));
+                    local_dpu_idx++;
+                }
+                DPU_ASSERT(dpu_push_xfer(
+                    rank,
+                    DPU_XFER_TO_DPU,
+                    "data",
+                    xfer_l_start * SLOT_DATA_SIZE,
+                    xfer_l_len * SLOT_DATA_SIZE,
+                    DPU_XFER_DEFAULT));
+
+                local_dpu_idx = 0;
+                DPU_FOREACH(rank, dpu)
+                {
+                    DPU_ASSERT(dpu_prepare_xfer(
+                        dpu,
+                        &ids[local_dpu_idx * xfer_l_len * SLOT_ID_SIZE /
+                             sizeof(ID_TYPE)]));
+                    local_dpu_idx++;
+                }
+                DPU_ASSERT(dpu_push_xfer(
+                    rank,
+                    DPU_XFER_TO_DPU,
+                    "data_id",
+                    xfer_l_start * SLOT_ID_SIZE,
+                    xfer_l_len * SLOT_ID_SIZE,
+                    DPU_XFER_DEFAULT));
+
+                delete[] data;
+                delete[] ids;
             }
-
-            dpu_set_t dpu;
-
-            DPU_FOREACH(fifo_set, dpu)
-            {
-                int dpu_id = GET_DPU_ID_BY_DPU(dpu);
-                DPU_ASSERT(dpu_prepare_xfer(
-                    dpu,
-                    &data[dpu_id * xfer_l_len * SLOT_DATA_SIZE /
-                          sizeof(DATA_TYPE)]));
-            }
-            DPU_ASSERT(dpu_push_xfer(
-                fifo_set,
-                DPU_XFER_TO_DPU,
-                "data",
-                xfer_l_start * SLOT_DATA_SIZE,
-                xfer_l_len * SLOT_DATA_SIZE,
-                DPU_XFER_DEFAULT));
-
-            DPU_FOREACH(fifo_set, dpu)
-            {
-                int dpu_id = GET_DPU_ID_BY_DPU(dpu);
-                DPU_ASSERT(dpu_prepare_xfer(
-                    dpu,
-                    &ids[dpu_id * xfer_l_len * SLOT_ID_SIZE /
-                         sizeof(ID_TYPE)]));
-            }
-            DPU_ASSERT(dpu_push_xfer(
-                fifo_set,
-                DPU_XFER_TO_DPU,
-                "data_id",
-                xfer_l_start * SLOT_ID_SIZE,
-                xfer_l_len * SLOT_ID_SIZE,
-                DPU_XFER_DEFAULT));
 
             // last do
             xfer_l_start += xfer_l_len;
-
-            delete[] data;
-            delete[] ids;
         }
     }
 }
@@ -499,7 +640,6 @@ void DPUWrapper::copy_dataset()
 void DPUWrapper::init_balance(int nprobe, int top_k)
 {
     /*-----------get balance info-----------*/
-
     int nq;
     int dim;
 
@@ -518,14 +658,12 @@ void DPUWrapper::init_balance(int nprobe, int top_k)
             cluster_info[idx[i * nprobe + j]]->history_freq++;
         }
     }
-
     std::ofstream outfile(freq_path, std::ios::trunc);
     for (int i = 0; i < mconfig.getMaxCluster(); i++)
     {
         outfile << cluster_info[i]->history_freq << std::endl;
     }
     outfile.close();
-
     outfile.open(size_path, std::ios::trunc);
 
     int64_t size_all = 0;
@@ -536,7 +674,6 @@ void DPUWrapper::init_balance(int nprobe, int top_k)
         size_all += size;
     }
     outfile.close();
-
     // assert(size_all == 1000000000);
 
     std::ifstream infile(freq_path);
@@ -546,7 +683,6 @@ void DPUWrapper::init_balance(int nprobe, int top_k)
         infile >> freq[i];
     }
     infile.close();
-
     infile.open(size_path);
     int size[mconfig.getMaxCluster()];
     for (int i = 0; i < mconfig.getMaxCluster(); i++)
@@ -591,7 +727,6 @@ void DPUWrapper::init_balance(int nprobe, int top_k)
         sum_rate += rate_each_shard[i];
     }
     printf("sum_rate: %f\n", sum_rate);
-
     double to1_rate_each_shard[mconfig.getMaxCluster()];
     for (int i = 0; i < mconfig.getMaxCluster(); i++)
     {
@@ -610,7 +745,6 @@ void DPUWrapper::init_balance(int nprobe, int top_k)
         }
     }
     have_slot = nr_dpu_pair * 2 * SLOT_NUM;
-
     double copy_rate = COPY_RATE;
 
     int copy_num[mconfig.getMaxCluster()];
@@ -717,7 +851,6 @@ void DPUWrapper::init_balance(int nprobe, int top_k)
         outfile << workload_perreplica[i] << std::endl;
     }
     outfile.close();
-
     outfile.open(replica_path, std::ios::trunc);
     for (int i = 0; i < mconfig.getMaxCluster(); i++)
     {
@@ -728,20 +861,28 @@ void DPUWrapper::init_balance(int nprobe, int top_k)
 
 void DPUWrapper::init_dataset()
 {
+    trace_log("init_dataset: begin");
     shard_dataset();
+    trace_log("init_dataset: shard_dataset done");
     replica_dataset();
+    trace_log("init_dataset: replica_dataset done");
     place_dataset();
+    trace_log("init_dataset: place_dataset done");
 
     // use fake_send_task
     copy_dataset();
+    trace_log("init_dataset: copy_dataset done");
 }
 
 void DPUWrapper::dpu_init()
 {
+    trace_log("dpu_init: begin");
     /*--------file init--------*/
     std::string json_path = std::string(PROJECT_SOURCE_DIR) + "/config.json";
     printf("json_path: %s\n", json_path.c_str());
     mconfig = mConfig(json_path);
+    trace_log("dpu_init: config loaded, max_cluster=%d, result_dir=%s",
+              mconfig.getMaxCluster(), mconfig.getReplaceDir().c_str());
 
     cluster_info.resize(mconfig.getMaxCluster());
     for (auto &cluster : cluster_info)
@@ -772,6 +913,7 @@ void DPUWrapper::dpu_init()
 #else
     // do nothing
 #endif
+    trace_log("dpu_init: dpu_alloc + dpu_load done");
 
     outfile_log_out.open(debug_path_log_out, std::ios::trunc);
     outfile_log_in.open(debug_path_log_in, std::ios::trunc);
@@ -781,11 +923,33 @@ void DPUWrapper::dpu_init()
     /*----- index and QUERY INFO----------------------------------*/
 
     fifo_index = dynamic_cast<faiss::IndexIVFPQ *>(faiss::read_index(index_path.c_str()));
+    if (fifo_index == nullptr)
+    {
+        throw std::runtime_error("Failed to load IndexIVFPQ from " + index_path);
+    }
+    trace_log("dpu_init: index loaded from %s", index_path.c_str());
 
     int dim;
     float *query_data = read_query(query_path.c_str(), QUERY_TYPE, query_num, dim);
+    if (query_data == nullptr)
+    {
+        throw std::runtime_error("Failed to load query file " + query_path);
+    }
 
     printf("query_num: %d, dim: %d\n", query_num, dim);
+    trace_log("dpu_init: query loaded, query_num=%d, dim=%d", query_num, dim);
+
+    if (query_num <= 0)
+    {
+        throw std::runtime_error("Query file contains no vectors: " + query_path);
+    }
+
+    if (dim != DIM)
+    {
+        throw std::runtime_error(
+            "Query dimension mismatch: expected " + std::to_string(DIM) +
+            ", got " + std::to_string(dim));
+    }
 
     query_info.resize(query_num);
 
@@ -794,12 +958,15 @@ void DPUWrapper::dpu_init()
         query_info_ = std::make_shared<QUERY_INFO>();
     }
 
-    assert(dim == DIM);
-
     int nq_gt;
     int k_gt;
     ID_TYPE *groundtruth_ids_arr =
         read_groundtruth(groundtruth_path.c_str(), nq_gt, k_gt);
+    if (groundtruth_ids_arr == nullptr)
+    {
+        throw std::runtime_error("Failed to load groundtruth file " + groundtruth_path);
+    }
+    trace_log("dpu_init: groundtruth loaded, nq_gt=%d, k_gt=%d", nq_gt, k_gt);
 
     assert(nq_gt >= query_num);
     assert(k_gt >= MAX_K);
@@ -834,21 +1001,22 @@ void DPUWrapper::dpu_init()
 
     for (int i = 0; i < FRONT_THREAD * MAX_COROUTINE; i++)
     {
-        float *sim_table_tmp = new float[mconfig.getMaxCluster() * LUT_SIZE];
+        float *sim_table_tmp = new float[MAX_NPROBE * LUT_SIZE];
         sim_table_buffer[i] = sim_table_tmp;
-        float *dis0_tmp = new float[mconfig.getMaxCluster()];
+        float *dis0_tmp = new float[MAX_NPROBE];
         dis0_buffer[i] = dis0_tmp;
 
         DIST_TYPE *sim_table_tmp_dynamic =
-            new DIST_TYPE[mconfig.getMaxCluster() * LUT_SIZE];
+            new DIST_TYPE[MAX_NPROBE * LUT_SIZE];
         sim_table_dynamictype[i] = sim_table_tmp_dynamic;
 
-        DIST_TYPE *dis0_tmp_dynamic = new DIST_TYPE[mconfig.getMaxCluster()];
+        DIST_TYPE *dis0_tmp_dynamic = new DIST_TYPE[MAX_NPROBE];
         dis0_dynamictype[i] = dis0_tmp_dynamic;
 
-        bool *send_flag_tmp = new bool[mconfig.getMaxCluster() * MAX_SHARD];
+        bool *send_flag_tmp = new bool[MAX_NPROBE * MAX_SHARD];
         send_flag_buffer[i] = send_flag_tmp;
     }
+    trace_log("dpu_init: per-thread buffers allocated");
 
     /*----------------init scanner----------------*/
 
@@ -856,6 +1024,9 @@ void DPUWrapper::dpu_init()
     {
         scanner[i] = fifo_index->get_InvertedListScanner(false, NULL);
     }
+    trace_log("dpu_init: scanners initialized");
+    trace_log("dpu_init: sizeof(dpu_fifo_input_t)=%zu sizeof(PAIR_TASK)=%zu coroutine_stack=%zu",
+              sizeof(dpu_fifo_input_t), sizeof(PAIR_TASK), get_coroutine_stack_size_bytes());
 
     /*------------------init symbol------------*/
 
@@ -873,7 +1044,7 @@ void DPUWrapper::dpu_init()
 
         DPU_INFO_COMMON info;
         info.dpu_id = dpu_id;
-        info.rank_id = dpu_get_rank_allocator_id(dpu.dpu);
+        info.rank_id = get_rank_linear_id(dpu.dpu);
         info.chip_id = dpu_get_slice_id(dpu.dpu);
         info.chip_dpu_id = dpu_get_member_id(dpu.dpu);
         DPU_ASSERT(dpu_copy_to(
@@ -895,7 +1066,7 @@ void DPUWrapper::dpu_init()
 
         dpu_info[dpu_id].line_id = GET_LINE_ID_BY_DPU(dpu);
         dpu_info[dpu_id].pair_line_id = GET_PAIR_LINE_ID_BY_DPUS(dpu);
-        dpu_info[dpu_id].rank_id = dpu_get_rank_allocator_id(dpu.dpu);
+        dpu_info[dpu_id].rank_id = get_rank_linear_id(dpu.dpu);
     }
 
     /*----------------------init PAIR INFO-----------------------*/
@@ -920,7 +1091,7 @@ void DPUWrapper::dpu_init()
 
     DPU_RANK_FOREACH(fifo_set, rank)
     {
-        int rank_id = dpu_get_rank_allocator_id2(rank.list.ranks[0]);
+        int rank_id = get_rank_linear_id(rank.list.ranks[0]);
         int rank_id_hw = dpu_get_rank_id(rank.list.ranks[0]);
         // printf("rank_id: %d, rank_id_hw: %d\n", rank_id, rank_id_hw);
 
@@ -934,8 +1105,10 @@ void DPUWrapper::dpu_init()
 
     /*-------------------init fifo------------------------*/
     FIFOinit();
+    trace_log("dpu_init: FIFOinit done");
 
     /*------------------------init CLUSTER INFO---------------------*/
+    trace_log("dpu_init: completed");
 }
 
 void DPUWrapper::dpu_reset()
@@ -1101,6 +1274,13 @@ void DPUWrapper::level2_search(
     int t_c_id = thread_id * MAX_COROUTINE + coroutine_id;
 
     std::shared_ptr<QUERY_INFO> query = query_info[q_id];
+    const bool trace_query = (q_id < 2);
+
+    if (trace_query)
+    {
+        trace_log("level2_search: q_id=%d thread=%d coroutine=%d begin",
+                  q_id, thread_id, coroutine_id);
+    }
 
     scanner[t_c_id]->set_query(query->query_data);
 
@@ -1115,7 +1295,7 @@ void DPUWrapper::level2_search(
     {
         scanner[t_c_id]->set_list(query->idx[i], query->coarse_dis[i]);
         scanner[t_c_id]->get_sim_table(
-            &sim_table_[query->idx[i] * LUT_SIZE], LUT_SIZE);
+            &sim_table_[i * LUT_SIZE], LUT_SIZE);
 
         // memcpy(
         //     &sim_table_[query->idx[i] * LUT_SIZE],
@@ -1124,16 +1304,28 @@ void DPUWrapper::level2_search(
 
         int c_id = query->idx[i];
 
-        scanner[t_c_id]->get_dis0(dis0_[c_id]);
+        scanner[t_c_id]->get_dis0(dis0_[i]);
 
         // dis0_[c_id] = scanner[t_c_id]->dis0;
 
         for (int j = 0; j < LUT_SIZE; j++)
         {
-            sim_table_dynamic[c_id * LUT_SIZE + j] =
-                (DIST_TYPE)(sim_table_[c_id * LUT_SIZE + j]);
+            sim_table_dynamic[i * LUT_SIZE + j] =
+                (DIST_TYPE)(sim_table_[i * LUT_SIZE + j]);
         }
-        dis0_dynamic[c_id] = (DIST_TYPE)(dis0_[c_id]);
+        dis0_dynamic[i] = (DIST_TYPE)(dis0_[i]);
+
+        if (trace_query && i < 2)
+        {
+            trace_log("level2_search: q_id=%d probe=%d key=%ld pair_shards=%d dis0=%d",
+                      q_id, i, static_cast<long>(query->idx[i]),
+                      cluster_info[query->idx[i]]->pair_shard_num, dis0_dynamic[i]);
+        }
+    }
+
+    if (trace_query)
+    {
+        trace_log("level2_search: q_id=%d LUT build done", q_id);
     }
 
     // timer.end();
@@ -1158,9 +1350,14 @@ void DPUWrapper::level2_search(
 
         for (int j = 0; j < pair_shard_num; j++)
         {
-            send_flag_[key * MAX_SHARD + j] = true;
+            send_flag_[i * MAX_SHARD + j] = true;
             need_send_num++;
         }
+    }
+    if (trace_query)
+    {
+        trace_log("level2_search: q_id=%d send flags initialized need_send_num=%d",
+                  q_id, need_send_num);
     }
     xmh::PerfCounter::Record("need_send_num", need_send_num);
 
@@ -1203,17 +1400,17 @@ void DPUWrapper::level2_search(
 
                         for (auto pair_location : cluster->pair_shard_info[j].pair_location)
                         {
-                            if (send_flag_[key * MAX_SHARD + j] == false)
+                            if (send_flag_[i * MAX_SHARD + j] == false)
                             {
                                 continue;
                             }
 
-                            PAIR_TASK pair_task;
+                            auto pair_task = std::make_unique<PAIR_TASK>();
                             int dpu_id = pair_location.dpu_id;
 
                             int pair_id = dpu_id / 2;
                             int rank_id = dpu_id / 64;
-                            pair_task.enable_num = 2;
+                            pair_task->enable_num = 2;
 
                             pair_info[pair_id].mtx_dpu_run.lock();
 
@@ -1237,7 +1434,7 @@ void DPUWrapper::level2_search(
                                 //         "num_is_running", num_is_running);
                                 // }
 
-                                send_flag_[key * MAX_SHARD + j] = false;
+                                send_flag_[i * MAX_SHARD + j] = false;
                                 need_send_num--;
                                 send_success = true;
                             }
@@ -1250,32 +1447,38 @@ void DPUWrapper::level2_search(
 
                             xmh::Timer timer4("   mram to dpu");
 
-                            int enable_num = pair_task.enable_num;
-                            pair_task.task[0].slot_id = pair_location.slot_id;
-                            pair_task.task[1].slot_id = pair_location.slot_id1;
+                            int enable_num = pair_task->enable_num;
+                            pair_task->task[0].slot_id = pair_location.slot_id;
+                            pair_task->task[1].slot_id = pair_location.slot_id1;
 
                             for (int task_id = 0; task_id < enable_num; task_id++)
                             {
-                                pair_task.task[task_id].dpu_id = dpu_id + task_id;
-                                pair_task.task[task_id].pair_id = pair_id;
-                                pair_task.task[task_id].rank_id = rank_id;
-                                pair_task.task[task_id].c_id = key;
+                                pair_task->task[task_id].dpu_id = dpu_id + task_id;
+                                pair_task->task[task_id].pair_id = pair_id;
+                                pair_task->task[task_id].rank_id = rank_id;
+                                pair_task->task[task_id].c_id = key;
                                 int shard_id = j * 2 + task_id;
-                                pair_task.task[task_id].shard_id = shard_id;
-                                pair_task.task[task_id].shard_l = cluster->s_len[shard_id];
+                                pair_task->task[task_id].shard_id = shard_id;
+                                pair_task->task[task_id].shard_l = cluster->s_len[shard_id];
 
-                                pair_task.task[task_id].q_id = q_id;
-                                pair_task.task[task_id].k = k;
-                                pair_task.task[task_id].dis0 =
-                                    dis0_dynamic[key];
-                                memcpy(pair_task.task[task_id].LUT,
-                                       &sim_table_dynamic[key * LUT_SIZE],
+                                pair_task->task[task_id].q_id = q_id;
+                                pair_task->task[task_id].k = k;
+                                pair_task->task[task_id].dis0 =
+                                    dis0_dynamic[i];
+                                memcpy(pair_task->task[task_id].LUT,
+                                       &sim_table_dynamic[i * LUT_SIZE],
                                        sizeof(DIST_TYPE) * LUT_SIZE);
+                            }
+
+                            if (trace_query)
+                            {
+                                trace_log("level2_search: q_id=%d single-coroutine dispatch probe=%d shard=%d dpu_id=%d pair_id=%d rank_id=%d enable_num=%d",
+                                          q_id, i, j, dpu_id, pair_id, rank_id, enable_num);
                             }
 
                             if (enable_num == 2)
                             {
-                                dpu_fifo_input_t &task_ = pair_task.task[0];
+                                dpu_fifo_input_t &task_ = pair_task->task[0];
 
                                 int dpu_id = task_.dpu_id;
 
@@ -1300,9 +1503,14 @@ void DPUWrapper::level2_search(
                                 }
 
                                 dpu_fifo_input_t &friend_task_ =
-                                    pair_task.task[1];
+                                    pair_task->task[1];
                                 int friend_dpu_id = friend_task_.dpu_id;
 
+                                if (trace_query)
+                                {
+                                    trace_log("level2_search: q_id=%d before fifo_dpu_copy_to dpu_id=%d friend_dpu_id=%d rank_id=%d",
+                                              q_id, dpu_id, friend_dpu_id, rank_id);
+                                }
                                 fifo_dpu_copy_to(
                                     dpu_id,
                                     friend_dpu_id,
@@ -1313,12 +1521,22 @@ void DPUWrapper::level2_search(
                                     (void *)&friend_task_,
                                     sizeof(dpu_fifo_input_t),
                                     0);
+                                if (trace_query)
+                                {
+                                    trace_log("level2_search: q_id=%d after fifo_dpu_copy_to dpu_id=%d friend_dpu_id=%d",
+                                              q_id, dpu_id, friend_dpu_id);
+                                }
                             }
                             else if (enable_num == 1)
                             {
-                                dpu_fifo_input_t &task_ = pair_task.task[0];
+                                dpu_fifo_input_t &task_ = pair_task->task[0];
 
                                 int dpu_id = task_.dpu_id;
+                                if (trace_query)
+                                {
+                                    trace_log("level2_search: q_id=%d before fifo_dpu_copy_to single dpu_id=%d rank_id=%d",
+                                              q_id, dpu_id, rank_id);
+                                }
                                 fifo_dpu_copy_to(
                                     dpu_id,
                                     -1,
@@ -1329,6 +1547,11 @@ void DPUWrapper::level2_search(
                                     NULL,
                                     sizeof(dpu_fifo_input_t),
                                     0);
+                                if (trace_query)
+                                {
+                                    trace_log("level2_search: q_id=%d after fifo_dpu_copy_to single dpu_id=%d",
+                                              q_id, dpu_id);
+                                }
                             }
                             else
                             {
@@ -1347,11 +1570,17 @@ void DPUWrapper::level2_search(
 
                             for (int j = 0; j < enable_num; j++)
                             {
-                                dpu_fifo_input_t &task_ = pair_task.task[j];
+                                dpu_fifo_input_t &task_ = pair_task->task[j];
 
                                 int dpu_id = task_.dpu_id;
 
                                 dpu_set_t &dpu = dpu_info[dpu_id].dpu;
+
+                                if (trace_query)
+                                {
+                                    trace_log("level2_search: q_id=%d before dpu_fifo_prepare_xfer dpu_id=%d input_offset=%d",
+                                              q_id, dpu_id, OFFSET_IN_FIFO(dpu_id));
+                                }
 
                                 DPU_ASSERT(dpu_fifo_prepare_xfer(
                                     dpu,
@@ -1359,8 +1588,18 @@ void DPUWrapper::level2_search(
                                     (void *)&input_fifo_data[OFFSET_IN_FIFO(
                                         dpu_id)]));
 
+                                if (trace_query)
+                                {
+                                    trace_log("level2_search: q_id=%d before dpu_fifo_push_xfer dpu_id=%d",
+                                              q_id, dpu_id);
+                                }
                                 DPU_ASSERT(dpu_fifo_push_xfer(
                                     dpu, &input_link, DPU_XFER_DEFAULT));
+                                if (trace_query)
+                                {
+                                    trace_log("level2_search: q_id=%d after dpu_fifo_push_xfer dpu_id=%d",
+                                              q_id, dpu_id);
+                                }
                             }
                             timer5.end();
 
@@ -1386,13 +1625,13 @@ void DPUWrapper::level2_search(
 
                     for (auto pair_location : cluster->pair_shard_info[j].pair_location)
                     {
-                        if (send_flag_[key * MAX_SHARD + j] == false)
+                        if (send_flag_[i * MAX_SHARD + j] == false)
                         {
                             continue;
                         }
 
-                        PAIR_TASK pair_task;
-                        pair_task.enable_num = 2;
+                        auto pair_task = std::make_unique<PAIR_TASK>();
+                        pair_task->enable_num = 2;
 
                         int dpu_id = pair_location.dpu_id;
                         int pair_id = dpu_id / 2;
@@ -1420,7 +1659,7 @@ void DPUWrapper::level2_search(
                             //         "num_is_running", num_is_running);
                             // }
 
-                            send_flag_[key * MAX_SHARD + j] = false;
+                            send_flag_[i * MAX_SHARD + j] = false;
                             need_send_num--;
                         }
                         else
@@ -1433,29 +1672,35 @@ void DPUWrapper::level2_search(
                         // xmh::Timer timer4("   mram to dpu");
                         start = std::chrono::high_resolution_clock::now(); 
 
-                        int enable_num = pair_task.enable_num;
+                        int enable_num = pair_task->enable_num;
 
-                        pair_task.task[0].slot_id = pair_location.slot_id;
-                        pair_task.task[1].slot_id = pair_location.slot_id1;
+                        pair_task->task[0].slot_id = pair_location.slot_id;
+                        pair_task->task[1].slot_id = pair_location.slot_id1;
 
                         for (int task_id = 0; task_id < enable_num; task_id++)
                         {
-                            pair_task.task[task_id].dpu_id = dpu_id + task_id;
-                            pair_task.task[task_id].pair_id = pair_id;
-                            pair_task.task[task_id].rank_id = rank_id;
+                            pair_task->task[task_id].dpu_id = dpu_id + task_id;
+                            pair_task->task[task_id].pair_id = pair_id;
+                            pair_task->task[task_id].rank_id = rank_id;
 
-                            pair_task.task[task_id].c_id = key;
+                            pair_task->task[task_id].c_id = key;
                             int shard_id = j * 2 + task_id;
-                            pair_task.task[task_id].shard_id = shard_id;
+                            pair_task->task[task_id].shard_id = shard_id;
 
-                            pair_task.task[task_id].shard_l = cluster->s_len[shard_id];
+                            pair_task->task[task_id].shard_l = cluster->s_len[shard_id];
 
-                            pair_task.task[task_id].q_id = q_id;
-                            pair_task.task[task_id].k = k;
-                            pair_task.task[task_id].dis0 = dis0_dynamic[key];
-                            memcpy(pair_task.task[task_id].LUT,
-                                   &sim_table_dynamic[key * LUT_SIZE],
+                            pair_task->task[task_id].q_id = q_id;
+                            pair_task->task[task_id].k = k;
+                            pair_task->task[task_id].dis0 = dis0_dynamic[i];
+                            memcpy(pair_task->task[task_id].LUT,
+                                   &sim_table_dynamic[i * LUT_SIZE],
                                    sizeof(DIST_TYPE) * LUT_SIZE);
+                        }
+
+                        if (trace_query)
+                        {
+                            trace_log("level2_search: q_id=%d dispatch probe=%d shard=%d dpu_id=%d pair_id=%d rank_id=%d enable_num=%d",
+                                      q_id, i, j, dpu_id, pair_id, rank_id, enable_num);
                         }
 
                         end = std::chrono::high_resolution_clock::now(); 
@@ -1467,7 +1712,7 @@ void DPUWrapper::level2_search(
 
                         if (enable_num == 2)
                         {
-                            dpu_fifo_input_t &task_ = pair_task.task[0];
+                            dpu_fifo_input_t &task_ = pair_task->task[0];
 
                             int dpu_id = task_.dpu_id;
 
@@ -1493,11 +1738,16 @@ void DPUWrapper::level2_search(
                                 // ms" << std::endl;
                             }
 
-                            dpu_fifo_input_t &friend_task_ = pair_task.task[1];
+                            dpu_fifo_input_t &friend_task_ = pair_task->task[1];
                             int friend_dpu_id = friend_task_.dpu_id;
                             dpu_info[friend_dpu_id].need_compute_distance_num +=
                                 friend_task_.shard_l;
 
+                            if (trace_query)
+                            {
+                                trace_log("level2_search: q_id=%d before fifo_dpu_copy_to dpu_id=%d friend_dpu_id=%d rank_id=%d",
+                                          q_id, dpu_id, friend_dpu_id, rank_id);
+                            }
                             fifo_dpu_copy_to(
                                 dpu_id,
                                 friend_dpu_id,
@@ -1508,14 +1758,24 @@ void DPUWrapper::level2_search(
                                 (void *)&friend_task_,
                                 sizeof(dpu_fifo_input_t),
                                 0);
+                            if (trace_query)
+                            {
+                                trace_log("level2_search: q_id=%d after fifo_dpu_copy_to dpu_id=%d friend_dpu_id=%d",
+                                          q_id, dpu_id, friend_dpu_id);
+                            }
                         }
                         else if (enable_num == 1)
                         {
 
                             printf("enable_num == 1, should not happen\n");
-                            dpu_fifo_input_t &task_ = pair_task.task[0];
+                            dpu_fifo_input_t &task_ = pair_task->task[0];
 
                             int dpu_id = task_.dpu_id;
+                            if (trace_query)
+                            {
+                                trace_log("level2_search: q_id=%d before fifo_dpu_copy_to single dpu_id=%d rank_id=%d",
+                                          q_id, dpu_id, rank_id);
+                            }
                             fifo_dpu_copy_to(
                                 dpu_id,
                                 -1,
@@ -1526,6 +1786,11 @@ void DPUWrapper::level2_search(
                                 NULL,
                                 sizeof(dpu_fifo_input_t),
                                 0);
+                            if (trace_query)
+                            {
+                                trace_log("level2_search: q_id=%d after fifo_dpu_copy_to single dpu_id=%d",
+                                          q_id, dpu_id);
+                            }
                         }
                         else
                         {
@@ -1546,11 +1811,17 @@ void DPUWrapper::level2_search(
 
                         for (int j = 0; j < enable_num; j++)
                         {
-                            dpu_fifo_input_t &task_ = pair_task.task[j];
+                            dpu_fifo_input_t &task_ = pair_task->task[j];
 
                             int dpu_id = task_.dpu_id;
 
                             dpu_set_t &dpu = dpu_info[dpu_id].dpu;
+
+                            if (trace_query)
+                            {
+                                trace_log("level2_search: q_id=%d before dpu_fifo_prepare_xfer dpu_id=%d input_offset=%d",
+                                          q_id, dpu_id, OFFSET_IN_FIFO(dpu_id));
+                            }
 
                             DPU_ASSERT(dpu_fifo_prepare_xfer(
                                 dpu,
@@ -1558,8 +1829,18 @@ void DPUWrapper::level2_search(
                                 (void *)&input_fifo_data[OFFSET_IN_FIFO(
                                     dpu_id)]));
 
+                            if (trace_query)
+                            {
+                                trace_log("level2_search: q_id=%d before dpu_fifo_push_xfer dpu_id=%d",
+                                          q_id, dpu_id);
+                            }
                             DPU_ASSERT(dpu_fifo_push_xfer(
                                 dpu, &input_link, DPU_XFER_DEFAULT));
+                            if (trace_query)
+                            {
+                                trace_log("level2_search: q_id=%d after dpu_fifo_push_xfer dpu_id=%d",
+                                          q_id, dpu_id);
+                            }
                         }
                         timer5.end();
 
@@ -1624,20 +1905,82 @@ void DPUWrapper::cooperative(
             return;
         }
 
+        if (q_id < 2)
+        {
+            trace_log("cooperative: thread=%d coroutine=%d q_id=%d begin",
+                      thread_id, coroutine_id, q_id);
+        }
+
         query_info[q_id]->start1();
         // xmh::Timer timer1("  1.1:level1_search");
         auto start = std::chrono::high_resolution_clock::now(); 
 
         level1_search(q_id, k, nprobe);
+        if (q_id < 2)
+        {
+            trace_log("cooperative: thread=%d coroutine=%d q_id=%d level1 done",
+                      thread_id, coroutine_id, q_id);
+        }
 
         auto end = std::chrono::high_resolution_clock::now(); 
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
 
         xmh::PerfCounter::Record("level1_search", duration.count());
 
-        xmh::Timer timer2("  1.2:level2_search");
-        level2_search(sink, q_id, k, nprobe, thread_id, coroutine_id);
-        timer2.end();
+        if (q_id < 2)
+        {
+            trace_log("cooperative: thread=%d coroutine=%d q_id=%d before timer2(level2)",
+                      thread_id, coroutine_id, q_id);
+        }
+
+        if (q_id < 2)
+        {
+            int t_c_id_dbg = thread_id * MAX_COROUTINE + coroutine_id;
+            std::shared_ptr<QUERY_INFO> query_dbg = query_info[q_id];
+            trace_log(
+                "cooperative: thread=%d coroutine=%d q_id=%d pointers query=%p query_data=%p idx=%p coarse_dis=%p scanner=%p nprobe=%d k=%d wait=%d complete=%d send_over=%d",
+                thread_id,
+                coroutine_id,
+                q_id,
+                static_cast<void *>(query_dbg.get()),
+                query_dbg ? static_cast<void *>(query_dbg->query_data) : nullptr,
+                query_dbg ? static_cast<void *>(query_dbg->idx) : nullptr,
+                query_dbg ? static_cast<void *>(query_dbg->coarse_dis) : nullptr,
+                static_cast<void *>(scanner[t_c_id_dbg]),
+                query_dbg ? query_dbg->nprobe : -1,
+                query_dbg ? query_dbg->k : -1,
+                query_dbg ? query_dbg->wait_dpu_num : -1,
+                query_dbg ? query_dbg->complete_num.load() : -1,
+                query_dbg ? (query_dbg->send_over ? 1 : 0) : -1);
+        }
+
+        const bool disable_level2_timer =
+            (std::getenv("PIM_ANNS_DISABLE_LEVEL2_TIMER") != nullptr);
+        if (!disable_level2_timer)
+        {
+            xmh::Timer timer2("  1.2:level2_search");
+            if (q_id < 2)
+            {
+                trace_log("cooperative: thread=%d coroutine=%d q_id=%d after timer2(level2) construction",
+                          thread_id, coroutine_id, q_id);
+            }
+            level2_search(sink, q_id, k, nprobe, thread_id, coroutine_id);
+            timer2.end();
+        }
+        else
+        {
+            if (q_id < 2)
+            {
+                trace_log("cooperative: thread=%d coroutine=%d q_id=%d level2 timer disabled",
+                          thread_id, coroutine_id, q_id);
+            }
+            level2_search(sink, q_id, k, nprobe, thread_id, coroutine_id);
+        }
+        if (q_id < 2)
+        {
+            trace_log("cooperative: thread=%d coroutine=%d q_id=%d level2 done",
+                      thread_id, coroutine_id, q_id);
+        }
 
         query_info[q_id]->send_over = true;
 
@@ -1647,21 +1990,27 @@ void DPUWrapper::cooperative(
 void DPUWrapper::search(int k, int nprobe, int thread_id)
 {
     bind_core(thread_id);
+    trace_log("search: front thread=%d start", thread_id);
     xmh::Timer timer(" 1:one_thread_send_task");
 
     coroutine<void>::pull_type worker[MAX_COROUTINE];
+    const boost::coroutines::attributes coroutine_attrs(
+        get_coroutine_stack_size_bytes());
 
     for (int i = 0; i < MAX_COROUTINE; i++)
     {
-        worker[i] = coroutine<void>::pull_type(std::bind(
-            &DPUWrapper::cooperative,
-            this,
-            std::placeholders::_1,
-            k,
-            nprobe,
-            thread_id,
-            i));
+        worker[i] = coroutine<void>::pull_type(
+            std::bind(
+                &DPUWrapper::cooperative,
+                this,
+                std::placeholders::_1,
+                k,
+                nprobe,
+                thread_id,
+                i),
+            coroutine_attrs);
     }
+    trace_log("search: front thread=%d workers created", thread_id);
 
     bool is_end = false;
     while (true)
@@ -1721,6 +2070,7 @@ void DPUWrapper::cpu_search(int *q_id, int k, int nprobe, int batch_size)
 
 void DPUWrapper::FIFOinit()
 {
+    trace_log("FIFOinit: begin");
     for (int i = 0; i < FRONT_THREAD; i++)
     {
         xfer_matrix[i] = (struct fifo_dpu_transfer_matrix *)malloc(
@@ -1777,6 +2127,7 @@ void DPUWrapper::FIFOinit()
 
         input_data[0] = i + OFFSET_INPUT_FIFO;
     }
+    trace_log("FIFOinit: output/input buffers prepared");
 };
 
 void DPUWrapper::clear_matrix(int rank_id, int thread_id, bool is_from)
@@ -2586,6 +2937,7 @@ dpu_fifo_output_t result[2560];
 void DPUWrapper::thread_fifo_out(const std::vector<int> &rank_id_v, int t_id)
 {
     bind_core(t_id + FRONT_THREAD);
+    trace_log("thread_fifo_out: start t_id=%d rank_count=%zu", t_id, rank_id_v.size());
 
     bool is_last = false;
 
@@ -2798,6 +3150,8 @@ void DPUWrapper::thread_fifo_out(const std::vector<int> &rank_id_v, int t_id)
 void DPUWrapper::thread_dynamic_balance(const std::vector<int> &cluster_id_v, int t_id)
 {
     bind_core(t_id + DynamicBalance_THREAD);
+    trace_log("thread_dynamic_balance: start t_id=%d cluster_count=%zu enabled=%d",
+              t_id, cluster_id_v.size(), mconfig.getEnableDynamic() ? 1 : 0);
 
     bool is_last = false;
     int check_interval = 1000;

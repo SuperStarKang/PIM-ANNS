@@ -27,7 +27,7 @@ set( UFI_SOURCES
         )
 
 add_library( dpu-ufi SHARED ${UFI_SOURCES} )
-target_include_directories( dpu-ufi PUBLIC ${COMMONS_INCLUDE_DIRECTORIES} ${SOURCE_DIRECTORY} ${GEN_INCLUDE_DIRECTORY})
+target_include_directories( dpu-ufi PUBLIC ${COMMONS_INCLUDE_DIRECTORIES} ${SOURCE_DIRECTORY} ${GEN_INCLUDE_DIRECTORY} ${PIM_ANNS_HOST_DIR})
 target_link_libraries( dpu-ufi dpuverbose )
 set_target_properties(dpu-ufi PROPERTIES VERSION ${UPMEM_VERSION})
 add_dependencies(dpu-ufi gen_files)

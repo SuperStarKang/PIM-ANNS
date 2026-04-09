@@ -331,7 +331,6 @@ __host ID_TYPE id_wram[NR_TASKLETS * IDSIZE];
 
 __host DIST_TYPE local_dis_all[NR_TASKLETS * MAX_K];
 __host ID_TYPE local_id_all[NR_TASKLETS * MAX_K];
-
 __mram uint64_t justaddtime;
 void delay(int ms) {
     for (int ii = 0; ii < ms * 4; ii++) {
@@ -368,10 +367,6 @@ void task_perf(int q_r_id) {
                 NULL,
                 NULL,
                 0);
-    }
-    barrier_wait(&barrier);
-
-    if (t_id == 0) {
         for (int i = 0; i < MY_PQ_M; i++) {
             mram_read(
                     (__mram_ptr void*)&query[q_r_id].LUT[i * MY_PQ_CLUSTER],
@@ -379,7 +374,6 @@ void task_perf(int q_r_id) {
                     MY_PQ_CLUSTER * sizeof(DIST_TYPE));
         }
     }
-
     barrier_wait(&barrier);
 
     int totallen = query[q_r_id].shard_l;
@@ -431,24 +425,18 @@ void task_perf(int q_r_id) {
         }
 
         for (int j = 0; j < use_len; j++) {
-            DIST_TYPE sum = query[q_r_id].dis0;
-
             ID_TYPE id = id_wram[INDEX_ID_W(t_id, j)];
-            // ID_TYPE id = data_id[INDEX_ID(slot_id, i + j)];
-
+            DIST_TYPE sum = query[q_r_id].dis0;
+            int index_lutw = 0;
             for (int l = 0; l < MY_PQ_M; l++) {
                 uint8_t pqcode = data_wram[INDEX_DATA_W(t_id, j, l)];
-
-                // uint8_t pqcode = data[INDEX_DATA(slot_id, i + j, l)];
-
-                sum += lutw[l * MY_PQ_CLUSTER + pqcode];
+                sum += lutw[index_lutw + pqcode];
+                index_lutw += MY_PQ_CLUSTER;
             }
             if (local_dis[0] > sum) {
                 heap_replace_top1(
                         query[q_r_id].k, local_dis, local_id, sum, id);
             }
-
-            // result_wram.dpu_id+=sum;
         }
     }
 

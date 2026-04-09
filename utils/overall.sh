@@ -2,7 +2,11 @@
 
 clear
 
-cd /home/wupuqing/workspace/PIM-ANNS/build
+# cd /home/wupuqing/workspace/PIM-ANNS/build
+
+SCRIPT_DIR="$(cd -- "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd)"
+cd "$PROJECT_ROOT/build"
 
 
 function run_space() {
@@ -43,7 +47,9 @@ function run_sift(){
 }
 
 
-path_common="/home/wupuqing/workspace/PIM-ANNS/common/dataset.h"
+# path_common="/home/wupuqing/workspace/PIM-ANNS/common/dataset.h"
+
+path_common="$PROJECT_ROOT/common/dataset.h"
 
 
 

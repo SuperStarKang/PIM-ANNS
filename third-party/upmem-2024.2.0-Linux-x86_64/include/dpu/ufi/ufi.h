@@ -14,7 +14,7 @@
 #include <ufi/ufi_ci.h>
 #include <dpu_types.h>
 
-#include "/home/wupuqing/upmem-src-2024.2.0-Linux-x86_64/faisiss_upmem/upmem/host/dpu_state.h"
+#include "dpu_state.h"
 
 #define ALL_CIS ((1u << DPU_MAX_NR_CIS) - 1u)
 

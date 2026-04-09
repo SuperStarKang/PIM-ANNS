@@ -6,18 +6,23 @@ cmake_minimum_required(VERSION 3.13)
 
 cmake_policy(SET CMP0048 NEW)
 
-find_package(JNI REQUIRED)
+find_package(JNI)
 find_package(Threads REQUIRED)
 find_package(LibElf REQUIRED)
 find_package(Python3 REQUIRED COMPONENTS Development)
 find_package(LibNuma REQUIRED)
 
-set( JAVA_HEADERS "${JAVA_INCLUDE_PATH}" "${JAVA_INCLUDE_PATH2}" )
+set(JAVA_HEADERS)
+if(JNI_FOUND)
+    set(JAVA_HEADERS "${JAVA_INCLUDE_PATH}" "${JAVA_INCLUDE_PATH2}")
+else()
+    message(WARNING "JNI headers not found; dpujni will not be built.")
+endif()
 
 set(VC_INCLUDE_DIRECTORIES ../verbose/src)
 set(UFI_INCLUDE_DIRECTORIES ../ufi/src ../ufi/include)
 set(COMMONS_INCLUDE_DIRECTORIES ../commons/include ../commons/src ../commons/src/properties)
-set(INCLUDE_DIRECTORIES include/lowlevel include/api src/include src/api/include ${UFI_INCLUDE_DIRECTORIES} ${COMMONS_INCLUDE_DIRECTORIES} ${VC_INCLUDE_DIRECTORIES} ${LIBELF_INCLUDE_DIR} ${Python3_INCLUDE_DIRS} ${LIBNUMA_INCLUDE_DIR} ${GEN_INCLUDE_DIRECTORY})
+set(INCLUDE_DIRECTORIES include/lowlevel include/api src/include src/api/include ${UFI_INCLUDE_DIRECTORIES} ${COMMONS_INCLUDE_DIRECTORIES} ${VC_INCLUDE_DIRECTORIES} ${LIBELF_INCLUDE_DIR} ${Python3_INCLUDE_DIRS} ${LIBNUMA_INCLUDE_DIR} ${GEN_INCLUDE_DIRECTORY} ${PIM_ANNS_HOST_DIR})
 
 set(PROPERTIES_SOURCES
         ../commons/src/properties/dpu_properties.c
@@ -87,16 +92,26 @@ target_compile_definitions(dpu PUBLIC DPU_TOOLS_VERSION=${UPMEM_VERSION})
 set_target_properties(dpu PROPERTIES VERSION ${UPMEM_VERSION})
 add_dependencies(dpu gen_files)
 
-add_library(dpujni SHARED ${JNI_SOURCES})
-target_include_directories(dpujni PUBLIC ${INCLUDE_DIRECTORIES} ${JAVA_HEADERS})
-target_link_libraries(dpujni dpu dpuverbose )
-set_target_properties(dpujni PROPERTIES VERSION ${UPMEM_VERSION})
+if(JNI_FOUND)
+    add_library(dpujni SHARED ${JNI_SOURCES})
+    target_include_directories(dpujni PUBLIC ${INCLUDE_DIRECTORIES} ${JAVA_HEADERS})
+    target_link_libraries(dpujni dpu dpuverbose )
+    set_target_properties(dpujni PROPERTIES VERSION ${UPMEM_VERSION})
+endif()
 
-install(
-    TARGETS dpu dpujni
-    LIBRARY
-    DESTINATION ${CMAKE_INSTALL_LIBDIR}
-    )
+if(JNI_FOUND)
+    install(
+        TARGETS dpu dpujni
+        LIBRARY
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        )
+else()
+    install(
+        TARGETS dpu
+        LIBRARY
+        DESTINATION ${CMAKE_INSTALL_LIBDIR}
+        )
+endif()
 
 install(
     DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/include/lowlevel/

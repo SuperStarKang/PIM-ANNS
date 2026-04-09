@@ -1,14 +1,15 @@
 #pragma once
 
-#define TEST_CPU
+#define TEST_DPU
 
-#define MY_PQ_M 20
+#define MY_PQ_M 32
 
-#define DIM 100
+#define DIM 128
 
-//sift1B: 0
-//space1B: 1
-#define QUERY_TYPE 1
+// u8bin uint8 query: 0
+// signed int8 query: 1
+// generic fvecs query: 2
+#define QUERY_TYPE 2
 
 #define SLOT_L 100000
 

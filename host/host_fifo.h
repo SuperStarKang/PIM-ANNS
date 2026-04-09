@@ -48,9 +48,13 @@ extern "C"
 #include <shared_mutex>
 
 #define GET_DPU_ID(r_id, c_id, d_id) (r_id * 64 + c_id * 8 + d_id)
+
+int get_rank_linear_id(struct dpu_t *dpu);
+int get_rank_linear_id(struct dpu_rank_t *rank);
+
 #define GET_DPU_ID_BY_DPU(d)                  \
         GET_DPU_ID(                           \
-            dpu_get_rank_allocator_id(d.dpu), \
+            get_rank_linear_id(d.dpu), \
             dpu_get_slice_id(d.dpu),          \
             dpu_get_member_id(d.dpu))
 
@@ -64,10 +68,10 @@ extern "C"
 #define GET_PAIR_ID(dpu_id) (dpu_id / 2)
 
 #define GET_LINE_ID_BY_DPU(d) \
-        (dpu_get_rank_allocator_id(d.dpu) * 8 + dpu_get_member_id(d.dpu))
+        (get_rank_linear_id(d.dpu) * 8 + dpu_get_member_id(d.dpu))
 
 #define GET_PAIR_LINE_ID_BY_DPUS(d) \
-        (dpu_get_rank_allocator_id(d.dpu) * 4 + dpu_get_member_id(d.dpu) / 2)
+        (get_rank_linear_id(d.dpu) * 4 + dpu_get_member_id(d.dpu) / 2)
 
 using namespace std;
 

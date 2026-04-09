@@ -2,7 +2,6 @@
 
 #include <fstream>
 #include <iostream>
-#include "gnuplot-iostream.h"
 
 #include "host/host_fifo.h"
 #include "third-party/faiss_upmem/faiss/impl/IDSelector.h"
@@ -754,14 +753,10 @@ void CPPkernel(int k = 10, int nprobe = 1)
 
     std::string dataset_path1;
 
-    if (dataset_path.find("SPACE") == 0)
-    {
-        dataset_path1 = dataset_path.substr(0, 7);
-    }
-    else if (dataset_path.find("SIFT") == 0)
-    {
-        dataset_path1 = dataset_path.substr(0, 6);
-    }
+    size_t dir_suffix = dataset_path.find("_DIR");
+    dataset_path1 = (dir_suffix == std::string::npos)
+                        ? dataset_path
+                        : dataset_path.substr(0, dir_suffix);
 
     printf("searching %s, nprobe = %d\n", dataset_path1.c_str(), nprobe);
 
@@ -774,7 +769,12 @@ void CPPkernel(int k = 10, int nprobe = 1)
         return;
     }
 
-    xmh::Reporter::StartReportThread();
+    const bool disable_reporter =
+        (std::getenv("PIM_ANNS_DISABLE_REPORTER") != nullptr);
+    if (!disable_reporter)
+    {
+        xmh::Reporter::StartReportThread();
+    }
     xmh::Timer timer("total");
 
 #if defined(TEST_CPU)
@@ -797,7 +797,11 @@ void CPPkernel(int k = 10, int nprobe = 1)
 
     timer.end();
 
-    xmh::Reporter::Report();
+    if (!disable_reporter)
+    {
+        xmh::Reporter::StopReportThread();
+        xmh::Reporter::Report();
+    }
 
     fclose(stdout);
 

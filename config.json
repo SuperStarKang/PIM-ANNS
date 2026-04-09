@@ -1,8 +1,8 @@
 {
-    "MAX_CLUSTER": 4096,
-    "RESULT_DIR": "SPACE1B20M4096_DIR",
-    "INDEX_PATH": "/mnt/optane/wpq/dataset/space/index/space1B_M20_PQ8_C4096_R_L2.faissindex",
-    "QUERY_PATH": "/mnt/optane/wpq/dataset/space/query10K.i8bin",
-    "HISTORY_QUERY_PATH": "/mnt/optane/wpq/dataset/space/query10K.i8bin",
-    "GROUNDTRUTH_PATH": "/mnt/optane/wpq/dataset/space/space1B_L2_gt_k100.bin"
+  "MAX_CLUSTER": 16384,
+  "RESULT_DIR": "SIFT100M16384M32_DIR",
+  "INDEX_PATH": "/home/dlrkdals/datasets/sift100M/sift100M.16384.32.8.index",
+  "QUERY_PATH": "/home/dlrkdals/datasets/sift100M/sift100M_query.fvecs",
+  "HISTORY_QUERY_PATH": "/home/dlrkdals/datasets/sift100M/sift100M_query.fvecs",
+  "GROUNDTRUTH_PATH": "/home/dlrkdals/datasets/sift100M/sift100M_groundtruth.ivecs"
 }
