@@ -6,6 +6,8 @@ SRC_DIR="/home/jiet/msmarco"
 DST_DIR="/home/dlrkdals/datasets/msmarco10M_pim"
 RESULT_DIR="$PROJECT_ROOT/MSMARCO10M4096M128_DIR"
 TEMPLATE_CONFIG="$PROJECT_ROOT/msmarco10M-4096-128.json"
+ACTIVE_CONFIG="$PROJECT_ROOT/config.json"
+BACKUP_CONFIG="$PROJECT_ROOT/config.json.backup.before_msmarco10m"
 
 mkdir -p "$DST_DIR"
 
@@ -26,8 +28,16 @@ done
 
 mkdir -p "$RESULT_DIR/CPU_DIR" "$RESULT_DIR/DPU_DIR" "$RESULT_DIR/BATCH_DPU_DIR"
 
+if [[ -f "$ACTIVE_CONFIG" ]]; then
+  cp "$ACTIVE_CONFIG" "$BACKUP_CONFIG"
+fi
+
+cp "$TEMPLATE_CONFIG" "$ACTIVE_CONFIG"
+
 echo "staged MSMARCO10M local dataset under $DST_DIR"
 echo "config template: $TEMPLATE_CONFIG"
+echo "active config: $ACTIVE_CONFIG"
+echo "config backup: $BACKUP_CONFIG"
 echo
 echo "Notes:"
 echo "  - This stages symlinks only. Original files under /home/jiet/msmarco are unchanged."
