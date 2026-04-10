@@ -1,0 +1,8 @@
+{
+  "MAX_CLUSTER": 16384,
+  "RESULT_DIR": "SIFT100M16384M32_DIR",
+  "INDEX_PATH": "/home/dlrkdals/datasets/sift100M_pim/sift100M.16384.32.8.index",
+  "QUERY_PATH": "/home/dlrkdals/datasets/sift100M_pim/sift100M_query.fvecs",
+  "HISTORY_QUERY_PATH": "/home/dlrkdals/datasets/sift100M_pim/sift100M_query.fvecs",
+  "GROUNDTRUTH_PATH": "/home/dlrkdals/datasets/sift100M_pim/sift100M_groundtruth.ivecs"
+}
